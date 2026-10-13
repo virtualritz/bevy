@@ -10,30 +10,39 @@ keywords = ["bevy"]
 
 [dependencies]
 # bevy
-bevy_anti_alias = { path = "../bevy_anti_alias", version = "0.20.0" }
-bevy_app = { path = "../bevy_app", version = "0.20.0" }
-bevy_asset = { path = "../bevy_asset", version = "0.20.0" }
-bevy_camera = { path = "../bevy_camera", version = "0.20.0" }
-bevy_color = { path = "../bevy_color", version = "0.20.0" }
-bevy_core_pipeline = { path = "../bevy_core_pipeline", version = "0.20.0" }
-bevy_derive = { path = "../bevy_derive", version = "0.20.0" }
-bevy_diagnostic = { path = "../bevy_diagnostic", version = "0.20.0" }
-bevy_ecs = { path = "../bevy_ecs", version = "0.20.0" }
-bevy_light = { path = "../bevy_light", version = "0.20.0" }
-bevy_shader = { path = "../bevy_shader", version = "0.20.0" }
-bevy_math = { path = "../bevy_math", version = "0.20.0" }
-bevy_mesh = { path = "../bevy_mesh", version = "0.20.0" }
-bevy_pbr = { path = "../bevy_pbr", version = "0.20.0", features = [
+# These bevy crates are named by version only, on purpose. This crate is consumed as a
+# `[patch.crates-io]` replacement from a git checkout, and cargo resolves the intra-repo `path`
+# dependencies of a git dependency to that same git source. That would put a second `bevy_app`,
+# `bevy_render` and so on into the consumer's graph, beside the registry copies the consumer's
+# `bevy` depends on -- two incompatible instances of every bevy type, which cannot be added to one
+# `App`. Naming the version keeps this crate's neighbours coming from crates.io, where the rest of
+# the consumer's bevy already comes from. Drop the version-only form and restore the paths once the
+# external-geometry seam this fork carries lands upstream.
+# See https://github.com/bevyengine/bevy/issues/26145.
+bevy_anti_alias = { version = "0.20.0" }
+bevy_app = { version = "0.20.0" }
+bevy_asset = { version = "0.20.0" }
+bevy_camera = { version = "0.20.0" }
+bevy_color = { version = "0.20.0" }
+bevy_core_pipeline = { version = "0.20.0" }
+bevy_derive = { version = "0.20.0" }
+bevy_diagnostic = { version = "0.20.0" }
+bevy_ecs = { version = "0.20.0" }
+bevy_light = { version = "0.20.0" }
+bevy_shader = { version = "0.20.0" }
+bevy_math = { version = "0.20.0" }
+bevy_mesh = { version = "0.20.0" }
+bevy_pbr = { version = "0.20.0", features = [
   "dfg_lut",
 ] }
-bevy_platform = { path = "../bevy_platform", version = "0.20.0", default-features = false, features = [
+bevy_platform = { version = "0.20.0", default-features = false, features = [
   "std",
 ] }
-bevy_reflect = { path = "../bevy_reflect", version = "0.20.0" }
-bevy_render = { path = "../bevy_render", version = "0.20.0" }
-bevy_image = { path = "../bevy_image", version = "0.20.0" }
-bevy_utils = { path = "../bevy_utils", version = "0.20.0" }
-bevy_transform = { path = "../bevy_transform", version = "0.20.0" }
+bevy_reflect = { version = "0.20.0" }
+bevy_render = { version = "0.20.0" }
+bevy_image = { version = "0.20.0" }
+bevy_utils = { version = "0.20.0" }
+bevy_transform = { version = "0.20.0" }
 
 # other
 bytemuck = { version = "1" }

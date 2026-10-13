@@ -15,7 +15,9 @@ use self::instances::{
 use self::lights::LightState;
 use self::tlas::TlasState;
 pub use self::tlas::{build_raytracing_tlas, TlasInstanceSetupPipeline};
-use super::{blas::BlasManager, extract::StandardMaterialAssets, RaytracingMesh3d};
+use super::{
+    blas::BlasManager, extract::StandardMaterialAssets, RaytracingExternalMesh, RaytracingMesh3d,
+};
 use bevy_ecs::{
     entity::Entity,
     lifecycle::RemovedComponents,
@@ -128,6 +130,7 @@ pub fn prepare_raytracing_scene_resources(
     instances: Query<InstanceQueryData>,
     changed_instances: Query<Entity, ChangedInstanceFilter>,
     mut removed_instances: RemovedComponents<RaytracingMesh3d>,
+    mut removed_external_instances: RemovedComponents<RaytracingExternalMesh>,
     directional_lights: Query<(Entity, &ExtractedDirectionalLight)>,
     needs_previous_frame_data: Option<Res<RaytracingSceneNeedsPreviousFrameData>>,
     mesh_allocator: Res<MeshAllocator>,
@@ -159,9 +162,12 @@ pub fn prepare_raytracing_scene_resources(
     );
 
     // Apply structural instance changes, now that asset slots are current
-    bindings
-        .instances
-        .remove_instances(&mut bindings.lights, removed_instances.read());
+    bindings.instances.remove_instances(
+        &mut bindings.lights,
+        removed_instances
+            .read()
+            .chain(removed_external_instances.read()),
+    );
     let inputs = InstanceInputs {
         assets: &bindings.assets,
         blas_manager: &blas_manager,

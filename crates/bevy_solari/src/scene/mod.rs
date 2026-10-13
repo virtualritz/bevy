@@ -7,7 +7,10 @@ use bevy_asset::embedded_asset;
 use bevy_shader::load_shader_library;
 pub use binder::prepare_raytracing_scene_resources;
 pub use binder::{RaytracingSceneBindings, RaytracingSceneNeedsPreviousFrameData};
-pub use types::RaytracingMesh3d;
+pub use types::{
+    ExternalMeshGeometry, ExternalVertexAttribute, RaytracingExternalMesh, RaytracingGeometryId,
+    RaytracingMesh3d,
+};
 
 use crate::SolariPlugins;
 use bevy_app::{App, Plugin};
@@ -27,9 +30,10 @@ use binder::{
 };
 use blas::{compact_raytracing_blas, delete_raytracing_blas, prepare_raytracing_blas, BlasManager};
 use extract::{
-    extract_raytracing_environment_map_light, extract_raytracing_material_assets,
-    extract_raytracing_scene_meshes_and_materials, extract_raytracing_scene_structural,
-    extract_raytracing_scene_transforms, ExtractedEnvironmentMapLight, StandardMaterialAssets,
+    extract_raytracing_environment_map_light, extract_raytracing_external_meshes,
+    extract_raytracing_material_assets, extract_raytracing_scene_meshes_and_materials,
+    extract_raytracing_scene_structural, extract_raytracing_scene_transforms,
+    ExtractedEnvironmentMapLight, ExtractedExternalMeshes, StandardMaterialAssets,
 };
 use tracing::warn;
 
@@ -63,6 +67,7 @@ impl Plugin for RaytracingScenePlugin {
             .extra_buffer_usages |= BufferUsages::BLAS_INPUT | BufferUsages::STORAGE;
 
         render_app
+            .init_resource::<ExtractedExternalMeshes>()
             .init_resource::<ExtractedEnvironmentMapLight>()
             .init_gpu_resource::<BlasManager>()
             .init_gpu_resource::<StandardMaterialAssets>()
@@ -74,6 +79,7 @@ impl Plugin for RaytracingScenePlugin {
                     extract_raytracing_scene_structural,
                     extract_raytracing_scene_transforms,
                     extract_raytracing_scene_meshes_and_materials,
+                    extract_raytracing_external_meshes,
                     extract_raytracing_material_assets,
                     extract_raytracing_environment_map_light,
                 ),

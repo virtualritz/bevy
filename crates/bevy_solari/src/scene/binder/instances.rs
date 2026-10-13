@@ -2,8 +2,9 @@ use super::{
     allocator::{IndexAllocator, RetainedBindingArray},
     assets::AssetState,
     lights::{GpuLightSource, LightSourceId, LightState},
-    BlasManager, RaytracingMesh3d, RaytracingSceneBindings,
+    BlasManager, RaytracingExternalMesh, RaytracingMesh3d, RaytracingSceneBindings,
 };
+use crate::scene::{ExternalMeshGeometry, ExternalVertexAttribute, RaytracingGeometryId};
 use bevy_asset::AssetId;
 use bevy_ecs::{
     entity::{Entity, EntityHashMap, EntityHashSet},
@@ -11,12 +12,11 @@ use bevy_ecs::{
     system::Query,
 };
 use bevy_math::{Affine3, Affine3Ext, Vec4};
-use bevy_mesh::Mesh;
 use bevy_pbr::{MeshMaterial3d, PreviousGlobalTransform, StandardMaterial};
 use bevy_platform::collections::HashMap;
 use bevy_render::{
     impl_atomic_pod,
-    mesh::allocator::MeshAllocator,
+    mesh::allocator::{MeshAllocator, MeshBufferSlice},
     render_resource::{AtomicPod, AtomicSparseBufferVec, Buffer, BufferId, BufferUsages},
 };
 use bevy_transform::components::GlobalTransform;
@@ -27,13 +27,31 @@ use tracing::{info_span, warn};
 
 pub const MAX_MESH_SLAB_COUNT: NonZeroU32 = NonZeroU32::new(500).unwrap();
 
+/// Words (four-byte units) `MeshAllocator` uses per vertex for a mesh with solari's required
+/// attribute set: `POSITION`, `NORMAL`, `UV_0`, `TANGENT`, each tightly packed.
+const MESH_VERTEX_WORDS: u32 = 12;
+const MESH_NORMAL_WORD: u32 = 3;
+const MESH_UV_WORD: u32 = 6;
+const MESH_TANGENT_WORD: u32 = 8;
+
 #[derive(Clone, Copy, Default, PartialEq, Pod, Zeroable)]
 #[repr(C)]
 pub struct GpuInstanceGeometryIds {
     vertex_buffer_id: u32,
-    vertex_buffer_offset: u32,
     index_buffer_id: u32,
-    index_buffer_offset: u32,
+    /// Word offset of the first vertex's position within the vertex buffer.
+    position_word_offset: u32,
+    /// Word step between consecutive vertices' positions.
+    position_word_stride: u32,
+    normal_word_offset: u32,
+    normal_word_stride: u32,
+    /// Zero stride marks the attribute absent, and the shader substitutes a default.
+    uv_word_offset: u32,
+    uv_word_stride: u32,
+    tangent_word_offset: u32,
+    tangent_word_stride: u32,
+    /// Word offset of the first index within the index buffer.
+    index_offset: u32,
     triangle_count: u32,
 }
 
@@ -72,7 +90,7 @@ fn storage_buffer<T: AtomicPod>(label: &str) -> AtomicSparseBufferVec<T> {
 #[derive(Clone, Copy)]
 struct Instance {
     slot: u32,
-    mesh: AssetId<Mesh>,
+    geometry: RaytracingGeometryId,
     material: AssetId<StandardMaterial>,
     buffers: Option<(BufferId, BufferId)>,
 }
@@ -89,8 +107,8 @@ pub struct InstanceState {
     pub slots: IndexAllocator,
     records: EntityHashMap<Instance>,
     pub live_count: u32,
-    pub pending_refresh: EntityHashSet,
-    mesh_instances: HashMap<AssetId<Mesh>, EntityHashSet>,
+    pending_refresh: EntityHashSet,
+    geometry_instances: HashMap<RaytracingGeometryId, EntityHashSet>,
     pub material_instances: HashMap<AssetId<StandardMaterial>, EntityHashSet>,
 }
 
@@ -108,21 +126,21 @@ impl InstanceState {
             records: EntityHashMap::default(),
             live_count: 0,
             pending_refresh: EntityHashSet::default(),
-            mesh_instances: HashMap::default(),
+            geometry_instances: HashMap::default(),
             material_instances: HashMap::default(),
         }
     }
 
-    /// Every drawable instance's slot, mesh and world-from-local transform.
+    /// Every drawable instance's slot, geometry and world-from-local transform.
     ///
     /// Only the `wgpu-core` TLAS build path needs this, to fill in the instance descriptors that
     /// the raw path sets up on the GPU. Slots with a null acceleration structure reference are not
     /// currently drawable, and are left out.
-    pub fn drawable(&self) -> impl Iterator<Item = (u32, AssetId<Mesh>, [f32; 12])> + '_ {
+    pub fn drawable(&self) -> impl Iterator<Item = (u32, RaytracingGeometryId, [f32; 12])> + '_ {
         self.records.values().filter_map(|instance| {
             let slot = instance.slot;
             (self.blas_refs.get(slot) != GpuBlasRef::NONE)
-                .then(|| (slot, instance.mesh, self.transforms.get(slot).rows()))
+                .then(|| (slot, instance.geometry, self.transforms.get(slot).rows()))
         })
     }
 
@@ -135,16 +153,18 @@ impl InstanceState {
 }
 
 pub type InstanceQueryData<'w> = (
-    &'w RaytracingMesh3d,
+    Option<&'w RaytracingMesh3d>,
+    Option<&'w RaytracingExternalMesh>,
     &'w MeshMaterial3d<StandardMaterial>,
     &'w GlobalTransform,
     &'w PreviousGlobalTransform,
 );
 
 pub type ChangedInstanceFilter = (
-    With<RaytracingMesh3d>,
+    Or<(With<RaytracingMesh3d>, With<RaytracingExternalMesh>)>,
     Or<(
         Changed<RaytracingMesh3d>,
+        Changed<RaytracingExternalMesh>,
         Changed<MeshMaterial3d<StandardMaterial>>,
     )>,
 );
@@ -181,6 +201,81 @@ fn relink<K: Copy + Eq + Hash>(
     map.entry(key).or_default().insert(entity);
 }
 
+/// The geometry an instance names, whichever of the two components describes it.
+fn geometry_of(
+    mesh: Option<&RaytracingMesh3d>,
+    external: Option<&RaytracingExternalMesh>,
+) -> Option<RaytracingGeometryId> {
+    mesh.map(|mesh| RaytracingGeometryId::Mesh(mesh.id()))
+        .or_else(|| external.map(|external| RaytracingGeometryId::External(external.0.id)))
+}
+
+/// Where one instance's vertices and indices are, in the form the GPU sees them.
+struct ResolvedGeometry {
+    vertex_buffer: Buffer,
+    index_buffer: Buffer,
+    position_word_offset: u32,
+    position_word_stride: u32,
+    normal_word_offset: u32,
+    normal_word_stride: u32,
+    uv_word_offset: u32,
+    uv_word_stride: u32,
+    tangent_word_offset: u32,
+    tangent_word_stride: u32,
+    index_offset: u32,
+    triangle_count: u32,
+}
+
+/// A mesh slab's interleaved vertices, whose attribute offsets are fixed by the compatibility
+/// check that admitted the mesh.
+fn mesh_geometry(
+    vertex_slice: &MeshBufferSlice,
+    index_slice: &MeshBufferSlice,
+) -> ResolvedGeometry {
+    let base = vertex_slice.range.start * MESH_VERTEX_WORDS;
+    ResolvedGeometry {
+        vertex_buffer: vertex_slice.buffer.clone(),
+        index_buffer: index_slice.buffer.clone(),
+        position_word_offset: base,
+        position_word_stride: MESH_VERTEX_WORDS,
+        normal_word_offset: base + MESH_NORMAL_WORD,
+        normal_word_stride: MESH_VERTEX_WORDS,
+        uv_word_offset: base + MESH_UV_WORD,
+        uv_word_stride: MESH_VERTEX_WORDS,
+        tangent_word_offset: base + MESH_TANGENT_WORD,
+        tangent_word_stride: MESH_VERTEX_WORDS,
+        index_offset: index_slice.range.start,
+        triangle_count: (index_slice.range.len() / 3) as u32,
+    }
+}
+
+/// A host-built geometry's declared layout, or `None` when it has no positions or normals.
+fn external_geometry(geometry: &ExternalMeshGeometry) -> Option<ResolvedGeometry> {
+    let words = |attribute: &ExternalVertexAttribute| {
+        (attribute.byte_offset / 4, attribute.byte_stride / 4)
+    };
+    let (position_word_offset, position_word_stride) = words(&geometry.position);
+    let (normal_word_offset, normal_word_stride) = words(&geometry.normal);
+    let (uv_word_offset, uv_word_stride) = geometry.uv.as_ref().map_or((0, 0), words);
+    let (tangent_word_offset, tangent_word_stride) =
+        geometry.tangent.as_ref().map_or((0, 0), words);
+
+    (position_word_stride != 0 && normal_word_stride != 0).then(|| ResolvedGeometry {
+        vertex_buffer: geometry.vertex_buffer.clone(),
+        index_buffer: geometry.index_buffer.clone(),
+        position_word_offset,
+        position_word_stride,
+        normal_word_offset,
+        normal_word_stride,
+        uv_word_offset,
+        uv_word_stride,
+        tangent_word_offset,
+        tangent_word_stride,
+        index_offset: 0,
+        triangle_count: geometry.index_count / 3,
+    })
+}
+
 impl InstanceState {
     pub fn remove_instances(
         &mut self,
@@ -206,15 +301,15 @@ impl InstanceState {
         refresh.extend(changed_instances.iter());
 
         let moved_meshes = inputs.mesh_allocator.meshes_displaced_by_slab_growth();
-        for mesh_id in inputs
+        for geometry in inputs
             .blas_manager
             .changed_meshes()
             .iter()
             .copied()
-            .chain(moved_meshes)
+            .chain(moved_meshes.map(RaytracingGeometryId::Mesh))
         {
-            if let Some(mesh_instances) = self.mesh_instances.get(&mesh_id) {
-                refresh.extend(mesh_instances.iter().copied());
+            if let Some(geometry_instances) = self.geometry_instances.get(&geometry) {
+                refresh.extend(geometry_instances.iter().copied());
             }
         }
 
@@ -238,17 +333,21 @@ impl InstanceState {
         inputs: &InstanceInputs,
         lights: &mut LightState,
         entity: Entity,
-        (mesh, material, transform, previous_frame_transform): InstanceQueryData,
+        (mesh, external, material, transform, previous_frame_transform): InstanceQueryData,
     ) {
-        let mesh_id = mesh.id();
+        let Some(geometry) = geometry_of(mesh, external) else {
+            self.remove_instance(lights, entity);
+            return;
+        };
+
         let material_id = material.id();
         let previous = self.records.get(&entity).copied();
 
         relink(
-            &mut self.mesh_instances,
+            &mut self.geometry_instances,
             entity,
-            previous.map(|instance| instance.mesh),
-            mesh_id,
+            previous.map(|instance| instance.geometry),
+            geometry,
         );
         relink(
             &mut self.material_instances,
@@ -270,11 +369,11 @@ impl InstanceState {
 
         let mut instance = Instance {
             slot,
-            mesh: mesh_id,
+            geometry,
             material: material_id,
             buffers: previous.and_then(|instance| instance.buffers),
         };
-        let resolved = self.resolve_instance(inputs, lights, entity, &mut instance);
+        let resolved = self.resolve_instance(inputs, lights, entity, &mut instance, external);
 
         self.records.insert(entity, instance);
         if !resolved {
@@ -288,20 +387,43 @@ impl InstanceState {
         lights: &mut LightState,
         entity: Entity,
         instance: &mut Instance,
+        external: Option<&RaytracingExternalMesh>,
     ) -> bool {
         let slot = instance.slot;
-        let (Some(vertex_slice), Some(index_slice), Some(material_slot), Some(blas_address)) = (
-            inputs.mesh_allocator.mesh_vertex_slice(&instance.mesh),
-            inputs.mesh_allocator.mesh_index_slice(&instance.mesh),
+
+        let geometry = match instance.geometry {
+            RaytracingGeometryId::Mesh(mesh_id) => {
+                let (Some(vertex_slice), Some(index_slice)) = (
+                    inputs.mesh_allocator.mesh_vertex_slice(&mesh_id),
+                    inputs.mesh_allocator.mesh_index_slice(&mesh_id),
+                ) else {
+                    self.deactivate_instance(lights, entity, instance);
+                    return false;
+                };
+
+                mesh_geometry(&vertex_slice, &index_slice)
+            }
+            RaytracingGeometryId::External(_) => {
+                let Some(geometry) = external.and_then(|external| external_geometry(&external.0))
+                else {
+                    self.deactivate_instance(lights, entity, instance);
+                    return false;
+                };
+
+                geometry
+            }
+        };
+
+        let (Some(material_slot), Some(blas_address)) = (
             inputs.assets.material_slots.get(&instance.material),
-            inputs.blas_manager.device_address(&instance.mesh),
+            inputs.blas_manager.device_address(&instance.geometry),
         ) else {
             self.deactivate_instance(lights, entity, instance);
             return false;
         };
 
-        let vertex_buffer_key = vertex_slice.buffer.id();
-        let index_buffer_key = index_slice.buffer.id();
+        let vertex_buffer_key = geometry.vertex_buffer.id();
+        let index_buffer_key = geometry.index_buffer.id();
         let capacity = MAX_MESH_SLAB_COUNT.get();
         if !self.vertex_buffers.has_room(&vertex_buffer_key, capacity)
             || !self.index_buffers.has_room(&index_buffer_key, capacity)
@@ -318,24 +440,32 @@ impl InstanceState {
         let previous_buffers = instance.buffers.take();
         let vertex_buffer_id = self
             .vertex_buffers
-            .acquire(vertex_buffer_key, capacity, || vertex_slice.buffer.clone())
+            .acquire(vertex_buffer_key, capacity, || {
+                geometry.vertex_buffer.clone()
+            })
             .expect("vertex slab binding array had room but handed out no slot");
         let index_buffer_id = self
             .index_buffers
-            .acquire(index_buffer_key, capacity, || index_slice.buffer.clone())
+            .acquire(index_buffer_key, capacity, || geometry.index_buffer.clone())
             .expect("index slab binding array had room but handed out no slot");
         instance.buffers = Some((vertex_buffer_key, index_buffer_key));
         self.release_buffers(previous_buffers);
 
-        let triangle_count = (index_slice.range.len() / 3) as u32;
         self.geometry_ids.grow_and_set(
             slot,
             GpuInstanceGeometryIds {
                 vertex_buffer_id,
-                vertex_buffer_offset: vertex_slice.range.start,
                 index_buffer_id,
-                index_buffer_offset: index_slice.range.start,
-                triangle_count,
+                position_word_offset: geometry.position_word_offset,
+                position_word_stride: geometry.position_word_stride,
+                normal_word_offset: geometry.normal_word_offset,
+                normal_word_stride: geometry.normal_word_stride,
+                uv_word_offset: geometry.uv_word_offset,
+                uv_word_stride: geometry.uv_word_stride,
+                tangent_word_offset: geometry.tangent_word_offset,
+                tangent_word_stride: geometry.tangent_word_stride,
+                index_offset: geometry.index_offset,
+                triangle_count: geometry.triangle_count,
             },
         );
         self.material_ids.grow_and_set(slot, material_slot);
@@ -348,7 +478,7 @@ impl InstanceState {
         if is_emissive {
             lights.add_light(
                 LightSourceId::EmissiveMesh(entity),
-                GpuLightSource::new_emissive_mesh_light(slot, triangle_count),
+                GpuLightSource::new_emissive_mesh_light(slot, geometry.triangle_count),
             );
         } else {
             lights.remove_light(LightSourceId::EmissiveMesh(entity));
@@ -414,7 +544,7 @@ impl InstanceState {
         self.deactivate_instance(lights, entity, &mut instance);
         self.slots.release(instance.slot);
         self.pending_refresh.remove(&entity);
-        unlink(&mut self.mesh_instances, &instance.mesh, entity);
+        unlink(&mut self.geometry_instances, &instance.geometry, entity);
         unlink(&mut self.material_instances, &instance.material, entity);
     }
 }
