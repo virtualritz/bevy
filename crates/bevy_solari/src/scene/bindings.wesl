@@ -33,30 +33,34 @@ struct Vertex {
     tangent: vec4<f32>,
 }
 
-fn load_f32(words: ptr<storage, array<u32>, read>, word: u32) -> f32 {
-    return bitcast<f32>((*words)[word]);
-}
-
 // Reads one vertex through its declared layout, so a bevy mesh's interleaved attributes and a
 // host-built geometry's own layout both work from the same buffer binding.
-fn unpack_vertex(
-    words: ptr<storage, array<u32>, read>,
-    index: u32,
-    ids: InstanceGeometryIds,
-) -> Vertex {
+//
+// The buffer is indexed here rather than taken as a parameter: naga rejects a storage pointer
+// passed into a function, so `unpack_vertex` reaches the binding array itself.
+fn unpack_vertex(index: u32, ids: InstanceGeometryIds) -> Vertex {
+    let buffer = &vertex_buffers[ids.vertex_buffer_id].words;
     var vertex: Vertex;
 
     let p = ids.position_word_offset + index * ids.position_word_stride;
-    vertex.position = vec3(load_f32(words, p), load_f32(words, p + 1u), load_f32(words, p + 2u));
+    vertex.position = vec3(
+        bitcast<f32>((*buffer)[p]),
+        bitcast<f32>((*buffer)[p + 1u]),
+        bitcast<f32>((*buffer)[p + 2u]),
+    );
 
     let n = ids.normal_word_offset + index * ids.normal_word_stride;
-    vertex.normal = vec3(load_f32(words, n), load_f32(words, n + 1u), load_f32(words, n + 2u));
+    vertex.normal = vec3(
+        bitcast<f32>((*buffer)[n]),
+        bitcast<f32>((*buffer)[n + 1u]),
+        bitcast<f32>((*buffer)[n + 2u]),
+    );
 
     if ids.uv_word_stride == 0u {
         vertex.uv = vec2(0.0, 0.0);
     } else {
         let u = ids.uv_word_offset + index * ids.uv_word_stride;
-        vertex.uv = vec2(load_f32(words, u), load_f32(words, u + 1u));
+        vertex.uv = vec2(bitcast<f32>((*buffer)[u]), bitcast<f32>((*buffer)[u + 1u]));
     }
 
     if ids.tangent_word_stride == 0u {
@@ -64,10 +68,10 @@ fn unpack_vertex(
     } else {
         let t = ids.tangent_word_offset + index * ids.tangent_word_stride;
         vertex.tangent = vec4(
-            load_f32(words, t),
-            load_f32(words, t + 1u),
-            load_f32(words, t + 2u),
-            load_f32(words, t + 3u),
+            bitcast<f32>((*buffer)[t]),
+            bitcast<f32>((*buffer)[t + 1u]),
+            bitcast<f32>((*buffer)[t + 2u]),
+            bitcast<f32>((*buffer)[t + 3u]),
         );
     }
 
@@ -215,15 +219,14 @@ fn resolve_ray_hit_full(ray_hit: RayIntersection) -> ResolvedRayHitFull {
 
 fn load_vertices(instance_geometry_ids: InstanceGeometryIds, triangle_id: u32) -> array<Vertex, 3> {
     let index_buffer = &index_buffers[instance_geometry_ids.index_buffer_id].indices;
-    let vertex_buffer = &vertex_buffers[instance_geometry_ids.vertex_buffer_id].words;
 
     let indices_i = (triangle_id * 3u) + vec3(0u, 1u, 2u) + instance_geometry_ids.index_offset;
     let indices = vec3((*index_buffer)[indices_i.x], (*index_buffer)[indices_i.y], (*index_buffer)[indices_i.z]);
 
     return array<Vertex, 3>(
-        unpack_vertex(vertex_buffer, indices.x, instance_geometry_ids),
-        unpack_vertex(vertex_buffer, indices.y, instance_geometry_ids),
-        unpack_vertex(vertex_buffer, indices.z, instance_geometry_ids)
+        unpack_vertex(indices.x, instance_geometry_ids),
+        unpack_vertex(indices.y, instance_geometry_ids),
+        unpack_vertex(indices.z, instance_geometry_ids)
     );
 }
 
